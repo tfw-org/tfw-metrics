@@ -1,0 +1,108 @@
+name: Collect ClusterFuzzLite metrics
+
+on:
+  schedule:
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: cflite-metrics
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out metrics repository
+        uses: actions/checkout@v4
+
+      - name: Check out persistent fuzzing corpus
+        uses: actions/checkout@v4
+        with:
+          repository: tfw-org/tfw-fuzzing
+          ref: main
+          token: ${{ secrets.TFW_ORG_READ_TOKEN }}
+          path: tfw-fuzzing-corpus
+          persist-credentials: false
+
+      - name: Check out published coverage report
+        uses: actions/checkout@v4
+        with:
+          repository: tfw-org/tfw-fuzzing
+          ref: gh-pages
+          token: ${{ secrets.TFW_ORG_READ_TOKEN }}
+          path: tfw-fuzzing-pages
+          persist-credentials: false
+
+      - name: Discover and collect completed TFW runs
+        env:
+          GH_TOKEN: ${{ secrets.TFW_ORG_READ_TOKEN }}
+          LOGS_ROOT: ${{ runner.temp }}/workflow-logs
+          CORPUS_ROOT: ${{ github.workspace }}/tfw-fuzzing-corpus
+          COVERAGE_ROOT: ${{ github.workspace }}/tfw-fuzzing-pages
+          OUTPUT_DIR: ${{ github.workspace }}/metrics
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$LOGS_ROOT" metrics
+          touch metrics/processed-runs.txt
+
+          curl --fail --silent --show-error --location \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            "$GITHUB_API_URL/repos/tfw-org/tfw/actions/runs?status=completed&per_page=100" \
+            --output "$RUNNER_TEMP/tfw-runs.json"
+
+          # Workflow names are discovered from GitHub's run metadata. The number
+          # of fuzz targets is parsed from each batch log and is never fixed here.
+          # Batch runs are all retained. Only the newest successful coverage run
+          # is associated with the current `latest` JaCoCo report; recording the
+          # same moving report against several older runs would falsify history.
+          jq -r '(.workflow_runs | map(select(.conclusion == "success" and .name == "ClusterFuzzLite batch fuzzing"))) + [(.workflow_runs | map(select(.conclusion == "success" and .name == "ClusterFuzzLite coverage")) | .[0] // empty)] | .[] | @base64' \
+            "$RUNNER_TEMP/tfw-runs.json" > "$RUNNER_TEMP/candidate-runs.txt"
+
+          while IFS= read -r encoded; do
+            run_json=$(printf '%s' "$encoded" | base64 --decode)
+            run_id=$(printf '%s' "$run_json" | jq -r '.id')
+            attempt=$(printf '%s' "$run_json" | jq -r '.run_attempt')
+            key="$run_id:$attempt"
+            if grep -Fxq "$key" metrics/processed-runs.txt; then
+              continue
+            fi
+
+            echo "Collecting $key: $(printf '%s' "$run_json" | jq -r '.name')"
+            run_dir="$LOGS_ROOT/$key"
+            mkdir -p "$run_dir"
+            curl --fail --silent --show-error --location \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/tfw-org/tfw/actions/runs/$run_id/logs" \
+              --output "$RUNNER_TEMP/run-logs.zip"
+            unzip -q -o "$RUNNER_TEMP/run-logs.zip" -d "$run_dir"
+
+            printf '%s\n' "$run_json" > "$RUNNER_TEMP/workflow-event.json"
+            EVENT_PATH="$RUNNER_TEMP/workflow-event.json" \
+              LOGS_DIR="$run_dir" \
+              CORPUS_ROOT="$CORPUS_ROOT" \
+              COVERAGE_ROOT="$COVERAGE_ROOT" \
+              OUTPUT_DIR="$OUTPUT_DIR" \
+              python .github/scripts/collect_cflite_metrics.py
+
+            echo "$key" >> metrics/processed-runs.txt
+          done < "$RUNNER_TEMP/candidate-runs.txt"
+
+      - name: Commit metrics history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add metrics
+          if git diff --cached --quiet; then
+            echo "No new metrics to commit."
+            exit 0
+          fi
+          git commit -m "Record ClusterFuzzLite metrics"
+          git push
