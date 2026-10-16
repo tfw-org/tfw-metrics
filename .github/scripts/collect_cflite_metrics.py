@@ -54,14 +54,30 @@ def parse_batch_logs():
     fuzzers, active = {}, None
     for path in sorted(p for p in LOGS_DIR.rglob("*") if p.is_file()):
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
         except OSError as exc:
             print(f"WARN: cannot read {path}: {exc}", file=sys.stderr)
             continue
         for line in lines:
             match = FUZZER_START.search(line)
             if match:
-                size_units = {"b": 1, "Kb": 1024, "Mb": 1024**2, "Gb": 1024**3}
+                active = match[1]
+                fuzzers.setdefault(active, {})
+                continue
+
+            if active is None:
+                continue
+
+            match = DONE.search(line)
+            if match:
+                size_units = {
+                    "b": 1,
+                    "Kb": 1024,
+                    "Mb": 1024**2,
+                    "Gb": 1024**3,
+                }
                 corpus_bytes = int(match[4]) * size_units[match[5]]
                 fuzzers[active].update(
                     cov=int(match[1]),
@@ -70,16 +86,21 @@ def parse_batch_logs():
                     active_corpus_bytes=corpus_bytes,
                 )
                 continue
-            if active is None:
-                continue
-            match = DONE.search(line)
-            if match:
-                fuzzers[active].update(cov=int(match[1]), ft=int(match[2]), active_corpus_units=int(match[3]), active_corpus_bytes=int(match[4]))
-            for pattern, key in ((EXECUTIONS, "executions"), (EXEC_RATE, "average_exec_per_sec"), (NEW_UNITS, "new_units_added")):
+
+            for pattern, key in (
+                (EXECUTIONS, "executions"),
+                (EXEC_RATE, "average_exec_per_sec"),
+                (NEW_UNITS, "new_units_added"),
+            ):
                 match = pattern.search(line)
                 if match:
                     fuzzers[active][key] = int(match[1])
-    return {name: stats for name, stats in fuzzers.items() if "cov" in stats and "ft" in stats}
+
+    return {
+        name: stats
+        for name, stats in fuzzers.items()
+        if "cov" in stats and "ft" in stats
+    }
 
 
 def file_fingerprint(directory):
