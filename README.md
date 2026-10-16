@@ -6,18 +6,19 @@ This repository collects historical metrics from TFW's ClusterFuzzLite runs. It 
 
 ## What is collected
 
-- `metrics/batch_fuzzers.csv`: one row per discovered fuzzer per successful batch run, including `cov`, `ft`, execution counts/rates, active corpus statistics, persistent corpus size, run ID/attempt, timestamp, and source commit SHA.
-- `metrics/coverage_runs.csv`: JaCoCo line and branch coverage summary observed after a successful coverage workflow.
-- `metrics/processed-runs.txt`: workflow run IDs and attempts already processed, preventing duplicate history rows.
+- `metrics/batch_fuzzers.csv`: one row per dynamically discovered fuzzer per successful batch run, with libFuzzer metrics and run/commit metadata.
+- `metrics/corpus_snapshots.csv`: timestamped observations of persistent corpus size, keyed to the exact `tfw-fuzzing` `main` commit. Corpus size is not retroactively attached to old batch runs.
+- `metrics/coverage_snapshots.csv`: timestamped observations of JaCoCo reports published on `gh-pages`, including that branch's commit and a report fingerprint. Reports are not attributed to unrelated workflow runs.
+- `metrics/processed-runs.txt`: batch run IDs and attempts successfully parsed, so failed downloads or parse attempts remain retryable.
 
-The collector discovers fuzzers from the logs of each batch run; it does not assume a fixed number of fuzzers.
+Fuzzer and corpus directories are discovered dynamically; no fixed fuzzer count is assumed. CSV inserts are idempotent by their stable run/snapshot keys.
 
 ## GitHub Actions setup
 
 Create a repository secret named `TFW_ORG_READ_TOKEN`. Use a fine-grained token with read access to Actions in `tfw-org/tfw` and read access to repository contents in `tfw-org/tfw-fuzzing`. Do not grant write access to those repositories. The workflow's built-in `GITHUB_TOKEN` writes metrics only to this repository.
 
-The workflow polls successful completed runs every six hours and can also be started manually. It examines the most recent 100 completed runs returned by GitHub. If the project eventually generates more than 100 runs between polls, increase pagination in the workflow so older runs are not missed.
+The scheduled workflow paginates through completed TFW Actions runs, processes successful batch runs oldest first, and records corpus and published-coverage snapshots independently on each scheduled or manual collection. Failed log downloads and parse failures are logged and left unprocessed for a later retry.
 
 ## Interpreting the data
 
-`cov` and `ft` are libFuzzer metrics, not source-code coverage percentages. Use `coverage_runs.csv` for JaCoCo line/branch coverage. Compare each fuzzer with its own previous runs, and interpret corpus size alongside coverage rather than as a success metric by itself.
+`cov` and `ft` are libFuzzer metrics, not source-code coverage percentages. Use `coverage_snapshots.csv` for JaCoCo line/branch coverage. Compare each fuzzer with its own previous runs, and interpret corpus size alongside coverage rather than as a success metric by itself.
