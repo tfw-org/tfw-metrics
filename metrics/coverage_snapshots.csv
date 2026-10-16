@@ -1,0 +1,2 @@
+observed_at,gh_pages_commit,report_path,report_fingerprint,line_missed,line_total,line_coverage_percent,branch_missed,branch_total,branch_coverage_percent
+2026-10-16T20:38:40.401228+00:00,8eaf79d095fa5841e32711dffbd802e866cb38e1,coverage/latest/report/linux/jacoco.xml,596cece0735ef4c6ca5150fd05365295832b7f4d68a89d0c3c3df8e7a05f93af,15707,17248,8.93,4309,4525,4.77
