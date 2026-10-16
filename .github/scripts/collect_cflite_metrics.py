@@ -18,7 +18,9 @@ COVERAGE_ROOT = Path(os.environ.get("COVERAGE_ROOT", "tfw-fuzzing-pages"))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "metrics"))
 NOW = datetime.now(timezone.utc).isoformat()
 FUZZER_START = re.compile(r"Running fuzzer:\s*([A-Za-z0-9_$.-]+)\.")
-DONE = re.compile(r"DONE\s+cov:\s*(\d+)\s+ft:\s*(\d+)\s+corp:\s*(\d+)/(\d+)b")
+DONE = re.compile(
+    r"DONE\s+cov:\s*(\d+)\s+ft:\s*(\d+)\s+corp:\s*(\d+)/(\d+)([KMG]?b)"
+)
 EXECUTIONS = re.compile(r"stat::number_of_executed_units:\s*(\d+)")
 EXEC_RATE = re.compile(r"stat::average_exec_per_sec:\s*(\d+)")
 NEW_UNITS = re.compile(r"stat::new_units_added:\s*(\d+)")
@@ -59,8 +61,14 @@ def parse_batch_logs():
         for line in lines:
             match = FUZZER_START.search(line)
             if match:
-                active = match.group(1)
-                fuzzers.setdefault(active, {})
+                size_units = {"b": 1, "Kb": 1024, "Mb": 1024**2, "Gb": 1024**3}
+                corpus_bytes = int(match[4]) * size_units[match[5]]
+                fuzzers[active].update(
+                    cov=int(match[1]),
+                    ft=int(match[2]),
+                    active_corpus_units=int(match[3]),
+                    active_corpus_bytes=corpus_bytes,
+                )
                 continue
             if active is None:
                 continue
