@@ -40,7 +40,6 @@ jobs:
       - name: Discover and collect completed TFW batch runs
         env:
           GH_TOKEN: ${{ secrets.TFW_ORG_READ_TOKEN }}
-          GH_TOKEN: ${{ secrets.TFW_ORG_READ_TOKEN }}
           LOGS_ROOT: ${{ runner.temp }}/workflow-logs
           CORPUS_ROOT: ${{ github.workspace }}/tfw-fuzzing-corpus
           COVERAGE_ROOT: ${{ github.workspace }}/tfw-fuzzing-pages
@@ -63,7 +62,7 @@ jobs:
             echo "Collecting $key"
             run_dir="$LOGS_ROOT/$key"
             mkdir -p "$run_dir"
-            if ! gh api --output "$RUNNER_TEMP/run-logs.zip" "repos/tfw-org/tfw/actions/runs/$run_id/logs"; then
+            if ! gh api "repos/tfw-org/tfw/actions/runs/$run_id/logs" > "$RUNNER_TEMP/run-logs.zip"; then
               echo "WARN: unable to download logs for $key; will retry next run" >&2
               continue
             fi

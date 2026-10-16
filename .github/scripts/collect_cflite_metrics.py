@@ -109,8 +109,19 @@ def corpus_snapshot(repo_sha):
         fp = file_fingerprint(directory)
         if latest.get(directory.name, {}).get("fingerprint") == fp:
             continue
-        append_unique(output, CORPUS_FIELDS, {"observed_at": NOW, "fuzzing_repo_commit": repo_sha, "fuzzer": directory.name, "persistent_corpus_files": len(files), "persistent_corpus_bytes": size, "fingerprint": fp}, ["fuzzer", "fingerprint"])
-
+        append_unique(
+            output,
+            CORPUS_FIELDS,
+            {
+                "observed_at": NOW,
+                "fuzzing_repo_commit": repo_sha,
+                "fuzzer": directory.name,
+                "persistent_corpus_files": len(files),
+                "persistent_corpus_bytes": size,
+                "fingerprint": fp,
+            },
+            ["fuzzing_repo_commit", "fuzzer", "fingerprint"],
+        )
 
 class TableParser(HTMLParser):
     def __init__(self):
@@ -186,7 +197,18 @@ def coverage_snapshot(pages_sha):
             print(f"WARN: cannot parse coverage report {path}: {exc}", file=sys.stderr); continue
         if not summary: continue
         fp = file_fingerprint(path.parent)
-        append_unique(OUTPUT_DIR / "coverage_snapshots.csv", COVERAGE_FIELDS, {"observed_at": NOW, "gh_pages_commit": pages_sha, "report_path": str(path.relative_to(COVERAGE_ROOT)), "report_fingerprint": fp, **summary}, ["report_fingerprint"])
+        append_unique(
+            OUTPUT_DIR / "coverage_snapshots.csv",
+            COVERAGE_FIELDS,
+            {
+                "observed_at": NOW,
+                "gh_pages_commit": pages_sha,
+                "report_path": str(path.relative_to(COVERAGE_ROOT)),
+                "report_fingerprint": fp,
+                **summary,
+            },
+            ["gh_pages_commit", "report_path", "report_fingerprint"],
+        )
         print(f"Coverage snapshot inspected: {path.relative_to(COVERAGE_ROOT)}")
         return
     print("WARN: no readable JaCoCo XML or HTML report found", file=sys.stderr)
