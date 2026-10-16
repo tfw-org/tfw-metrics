@@ -51,7 +51,7 @@ jobs:
           touch metrics/processed-runs.txt
           # --paginate retrieves every page; --slurp lets jq combine the page responses.
           gh api --paginate --slurp 'repos/tfw-org/tfw/actions/runs?status=completed&per_page=100' > "$RUNNER_TEMP/all-runs-pages.json"
-          jq -s '[.[][] | .workflow_runs[]? | select(.conclusion == "success" and .name == "ClusterFuzzLite batch fuzzing")] | unique_by(.id, .run_attempt) | sort_by(.created_at)[] | @base64' "$RUNNER_TEMP/all-runs-pages.json" > "$RUNNER_TEMP/candidate-runs.txt"
+          jq -sr '[.[][] | .workflow_runs[]? | select(.conclusion == "success" and .name == "ClusterFuzzLite batch fuzzing")] | unique_by(.id, .run_attempt) | sort_by(.created_at)[] | @base64' "$RUNNER_TEMP/all-runs-pages.json" > "$RUNNER_TEMP/candidate-runs.txt"
           while IFS= read -r encoded; do
             [ -n "$encoded" ] || continue
             run_json=$(printf '%s' "$encoded" | base64 --decode)
