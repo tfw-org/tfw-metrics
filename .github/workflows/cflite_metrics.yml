@@ -1,20 +1,31 @@
 name: Collect ClusterFuzzLite metrics
+
 on:
   schedule:
     - cron: '17 */6 * * *'
   workflow_dispatch:
+
 permissions:
   actions: read
   contents: write
+
 concurrency:
   group: cflite-metrics
   cancel-in-progress: false
+
 jobs:
   collect:
     runs-on: ubuntu-latest
     steps:
       - name: Check out metrics repository
         uses: actions/checkout@v4
+
+      - name: Check out metrics data branch
+        uses: actions/checkout@v4
+        with:
+          ref: metrics-data
+          path: metrics-data
+
       - name: Check out persistent fuzzing corpus
         uses: actions/checkout@v4
         with:
@@ -23,6 +34,7 @@ jobs:
           token: ${{ secrets.TFW_ORG_READ_TOKEN }}
           path: tfw-fuzzing-corpus
           persist-credentials: false
+
       - name: Check out published coverage report
         uses: actions/checkout@v4
         with:
@@ -31,63 +43,78 @@ jobs:
           token: ${{ secrets.TFW_ORG_READ_TOKEN }}
           path: tfw-fuzzing-pages
           persist-credentials: false
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+
       - name: Install safe XML parser
         run: python -m pip install -r requirements.txt
+
       - name: Discover and collect completed TFW batch runs
         env:
           GH_TOKEN: ${{ secrets.TFW_ORG_READ_TOKEN }}
           LOGS_ROOT: ${{ runner.temp }}/workflow-logs
           CORPUS_ROOT: ${{ github.workspace }}/tfw-fuzzing-corpus
           COVERAGE_ROOT: ${{ github.workspace }}/tfw-fuzzing-pages
-          OUTPUT_DIR: ${{ github.workspace }}/metrics
+          OUTPUT_DIR: ${{ github.workspace }}/metrics-data/metrics
         shell: bash
         run: |
           set -uo pipefail
-          mkdir -p "$LOGS_ROOT" metrics
-          touch metrics/processed-runs.txt
+          mkdir -p "$LOGS_ROOT" "$OUTPUT_DIR"
+          touch "$OUTPUT_DIR/processed-runs.txt"
+
           # --paginate retrieves every page; --slurp lets jq combine the page responses.
           gh api --paginate --slurp 'repos/tfw-org/tfw/actions/runs?status=completed&per_page=100' > "$RUNNER_TEMP/all-runs-pages.json"
+
           jq -sr '[.[][] | .workflow_runs[]? | select(.conclusion == "success" and .name == "ClusterFuzzLite batch fuzzing")] | unique_by(.id, .run_attempt) | sort_by(.created_at)[] | @base64' "$RUNNER_TEMP/all-runs-pages.json" > "$RUNNER_TEMP/candidate-runs.txt"
+
           while IFS= read -r encoded; do
             [ -n "$encoded" ] || continue
             run_json=$(printf '%s' "$encoded" | base64 --decode)
             run_id=$(printf '%s' "$run_json" | jq -r '.id')
             attempt=$(printf '%s' "$run_json" | jq -r '.run_attempt')
             key="$run_id:$attempt"
-            grep -Fxq "$key" metrics/processed-runs.txt && continue
+
+            grep -Fxq "$key" "$OUTPUT_DIR/processed-runs.txt" && continue
+
             echo "Collecting $key"
             run_dir="$LOGS_ROOT/$key"
             mkdir -p "$run_dir"
+
             if ! gh api "repos/tfw-org/tfw/actions/runs/$run_id/logs" > "$RUNNER_TEMP/run-logs.zip"; then
               echo "WARN: unable to download logs for $key; will retry next run" >&2
               continue
             fi
+
             if ! unzip -q -o "$RUNNER_TEMP/run-logs.zip" -d "$run_dir"; then
               echo "WARN: invalid log archive for $key; will retry next run" >&2
-              rm -rf "$run_dir"; continue
+              rm -rf "$run_dir"
+              continue
             fi
+
             printf '%s\n' "$run_json" > "$RUNNER_TEMP/workflow-event.json"
+
             if EVENT_PATH="$RUNNER_TEMP/workflow-event.json" LOGS_DIR="$run_dir" CORPUS_ROOT="$CORPUS_ROOT" COVERAGE_ROOT="$COVERAGE_ROOT" OUTPUT_DIR="$OUTPUT_DIR" python .github/scripts/collect_cflite_metrics.py; then
-              echo "$key" >> metrics/processed-runs.txt
+              echo "$key" >> "$OUTPUT_DIR/processed-runs.txt"
             else
               echo "WARN: parsing failed for $key; will retry next run" >&2
             fi
           done < "$RUNNER_TEMP/candidate-runs.txt"
+
       - name: Record independent corpus and coverage snapshots
         env:
           CORPUS_ROOT: ${{ github.workspace }}/tfw-fuzzing-corpus
           COVERAGE_ROOT: ${{ github.workspace }}/tfw-fuzzing-pages
-          OUTPUT_DIR: ${{ github.workspace }}/metrics
+          OUTPUT_DIR: ${{ github.workspace }}/metrics-data/metrics
         shell: bash
         run: |
           set -euo pipefail
           corpus_sha=$(git -C tfw-fuzzing-corpus rev-parse HEAD)
           pages_sha=$(git -C tfw-fuzzing-pages rev-parse HEAD)
-          mkdir -p metrics
+          mkdir -p "$OUTPUT_DIR"
+
           # Run snapshots without inventing a workflow-run attribution.
           CORPUS_SHA="$corpus_sha" PAGES_SHA="$pages_sha" python - <<'PY'
           import os, sys
@@ -96,11 +123,21 @@ jobs:
           c.corpus_snapshot(os.environ['CORPUS_SHA'])
           c.coverage_snapshot(os.environ['PAGES_SHA'])
           PY
-      - name: Commit metrics history
+
+      - name: Commit metrics history to metrics-data
+        working-directory: metrics-data
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Keep this branch's tree limited to generated metrics data.
+          git rm -r --cached --ignore-unmatch .
           git add metrics
-          if git diff --cached --quiet; then echo "No new metrics to commit."; exit 0; fi
+
+          if git diff --cached --quiet; then
+            echo "No new metrics to commit."
+            exit 0
+          fi
+
           git commit -m "Record ClusterFuzzLite metrics"
-          git push
+          git push origin HEAD:metrics-data
