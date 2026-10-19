@@ -130,27 +130,54 @@ function el(tag,attrs={},text=''){
   if(text!=='') e.textContent=text;
   return e;
 }
+
 function svgChart(series,opts={}){
   const w=900,h=280,L=58,R=20,T=18,B=42,iw=w-L-R,ih=h-T-B;
   const points=series.flatMap(s=>s.values.map(p=>p.y).filter(v=>v!=null));
   if(!points.length) return '<p class="muted">Not enough observations yet to draw a chart.</p>';
-  let min=opts.min??Math.min(0,...points),max=opts.max??Math.max(...points);
+
+  // Find bounds iteratively so large histories cannot exceed the argument limit.
+  // The default minimum includes zero, while the default maximum uses observed data.
+  let min=opts.min??0;
+  let max=opts.max??-Infinity;
+  for(const point of points){
+    if(opts.min==null) min=Math.min(min,point);
+    if(opts.max==null) max=Math.max(max,point);
+  }
   if(max===min) max=min+1;
-  const x=i=>L+(series[0].values.length<2?iw/2:i*iw/(series[0].values.length-1));
+
+  const valueCount=series[0].values.length;
+  const x=i=>L+(valueCount<2?iw/2:i*iw/(valueCount-1));
   const y=v=>T+ih-(v-min)/(max-min)*ih;
   const s=el('svg',{viewBox:`0 0 ${w} ${h}`,class:'chart',role:'img','aria-label':opts.label||'Historical metrics chart'});
+
   for(let i=0;i<5;i++){
     const val=min+(max-min)*i/4,yy=y(val);
     s.append(el('line',{x1:L,y1:yy,x2:w-R,y2:yy,stroke:'var(--line)','stroke-width':1}));
     s.append(el('text',{x:L-8,y:yy+4,'text-anchor':'end',fill:'var(--muted)','font-size':11},fmt(Math.round(val))));
   }
+
   series.forEach(ser=>{
     let d='';
+
+    // A missing observation breaks the line. Do not connect measurements
+    // across a gap, since doing so would imply data exists between them.
+    const appendPath=path=>{
+      if(path) s.append(el('path',{d:path,fill:'none',stroke:ser.color,
+        'stroke-width':2.5,'stroke-linejoin':'round'}));
+    };
+
     ser.values.forEach((p,i)=>{
-      if(p.y==null) return;
+      if(p.y==null){
+        appendPath(d);
+        d='';
+        return;
+      }
       d+=(d?' L':'M')+x(i)+' '+y(p.y);
     });
-    s.append(el('path',{d,fill:'none',stroke:ser.color,'stroke-width':2.5,'stroke-linejoin':'round'}));
+    appendPath(d);
+
+    // Keep the individual observation markers, including those adjacent to gaps.
     ser.values.forEach((p,i)=>{
       if(p.y!=null){
         const c=el('circle',{cx:x(i),cy:y(p.y),r:3.5,fill:ser.color});
@@ -159,6 +186,7 @@ function svgChart(series,opts={}){
       }
     });
   });
+
   const vals=series[0].values;
   [0,Math.floor((vals.length-1)/2),vals.length-1]
     .filter((v,i,a)=>a.indexOf(v)===i&&v>=0)
@@ -169,6 +197,7 @@ function svgChart(series,opts={}){
     });
   return s.outerHTML;
 }
+
 function chartInto(id,series,opts){$(id).innerHTML=svgChart(series,opts);}
 
 const batch=DATA.batch.slice().sort((a,b)=>a.completed_at.localeCompare(b.completed_at));
@@ -220,6 +249,7 @@ function drawFuzzer(){
       }</tr></tbody></table>`
     : '<p>No fuzzer data yet.</p>';
 }
+
 function drawCorpus(){
   const name=$('corpus-fuzzer').value,rows=corpus.filter(r=>r.fuzzer===name);
   chartInto('corpus-chart',[
@@ -227,16 +257,21 @@ function drawCorpus(){
      values:rows.map(r=>({label:date(r.observed_at),y:num(r.persistent_corpus_bytes)}))}
   ],{label:`Persistent corpus size for ${name}`,min:0});
 }
+
 chartInto('coverage-chart',[
   {name:'Line coverage %',color:'#1769aa',
    values:coverage.map(r=>({label:date(r.observed_at),y:num(r.line_coverage_percent)}))},
   {name:'Branch coverage %',color:'#e07a25',
    values:coverage.map(r=>({label:date(r.observed_at),y:num(r.branch_coverage_percent)}))}
 ],{label:'JaCoCo source coverage percentage',min:0,max:100});
+
 $('fuzzer').addEventListener('change',drawFuzzer);
 $('corpus-fuzzer').addEventListener('change',drawCorpus);
-if(fuzzers.length) drawFuzzer();
-if(corpusFuzzers.length) drawCorpus();
+
+// Always render the panels so empty datasets display their fallback messages.
+drawFuzzer();
+drawCorpus();
+
 $('updated').textContent=`Dashboard generated ${date(DATA.generatedAt)}. Coverage observations: ${coverage.length}; corpus observations: ${corpus.length}.`;
 </script>
 </body>

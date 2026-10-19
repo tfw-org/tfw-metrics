@@ -1,284 +1,262 @@
 #!/usr/bin/env python3
-"""Build a self-contained static dashboard from the metrics-data CSV files."""
+"""Collect ClusterFuzzLite run metrics and independent corpus/coverage snapshots."""
 import csv
+import hashlib
 import json
 import os
+import re
+import sys
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
+from defusedxml import ElementTree as ET
 
-DATA_DIR = Path(os.environ.get("METRICS_DIR", "metrics-data/metrics"))
-OUTPUT = Path(os.environ.get("DASHBOARD_DIR", "site")) / "index.html"
+EVENT_PATH = Path(os.environ.get("EVENT_PATH", "event.json"))
+LOGS_DIR = Path(os.environ.get("LOGS_DIR", "logs"))
+CORPUS_ROOT = Path(os.environ.get("CORPUS_ROOT", "tfw-fuzzing-corpus"))
+COVERAGE_ROOT = Path(os.environ.get("COVERAGE_ROOT", "tfw-fuzzing-pages"))
+OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "metrics"))
+NOW = datetime.now(timezone.utc).isoformat()
+FUZZER_START = re.compile(r"Running fuzzer:\s*([A-Za-z0-9_$.-]+)\.")
+DONE = re.compile(
+    r"DONE\s+cov:\s*(\d+)\s+ft:\s*(\d+)\s+corp:\s*(\d+)/(\d+)([KMG]?b)"
+)
+EXECUTIONS = re.compile(r"stat::number_of_executed_units:\s*(\d+)")
+EXEC_RATE = re.compile(r"stat::average_exec_per_sec:\s*(\d+)")
+NEW_UNITS = re.compile(r"stat::new_units_added:\s*(\d+)")
+BATCH_FIELDS = ["run_id", "run_attempt", "completed_at", "commit_sha", "fuzzer", "cov", "ft", "executions", "average_exec_per_sec", "active_corpus_units", "active_corpus_bytes", "new_units_added"]
+CORPUS_FIELDS = ["observed_at", "fuzzing_repo_commit", "fuzzer", "persistent_corpus_files", "persistent_corpus_bytes", "fingerprint"]
+COVERAGE_FIELDS = ["observed_at", "gh_pages_commit", "report_path", "report_fingerprint", "line_missed", "line_total", "line_coverage_percent", "branch_missed", "branch_total", "branch_coverage_percent"]
 
 
-def read_csv(name):
-    """Read one metrics CSV, treating a missing file as an empty dataset."""
-    path = DATA_DIR / name
+def rows(path):
     if not path.exists():
         return []
-    with path.open(newline="", encoding="utf-8") as stream:
-        return list(csv.DictReader(stream))
+    with path.open(newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def append_unique(path, fields, row, key_fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = rows(path)
+    key = tuple(str(row.get(k, "")) for k in key_fields)
+    if any(tuple(str(old.get(k, "")) for k in key_fields) == key for old in existing):
+        return False
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        if not path.stat().st_size:
+            writer.writeheader()
+        writer.writerow({field: row.get(field, "") for field in fields})
+    return True
+
+
+def parse_batch_logs():
+    fuzzers, active = {}, None
+    for path in sorted(p for p in LOGS_DIR.rglob("*") if p.is_file()):
+        try:
+            lines = path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
+        except OSError as exc:
+            print(f"WARN: cannot read {path}: {exc}", file=sys.stderr)
+            continue
+        for line in lines:
+            match = FUZZER_START.search(line)
+            if match:
+                active = match[1]
+                fuzzers.setdefault(active, {})
+                continue
+
+            if active is None:
+                continue
+
+            match = DONE.search(line)
+            if match:
+                size_units = {
+                    "b": 1,
+                    "Kb": 1024,
+                    "Mb": 1024**2,
+                    "Gb": 1024**3,
+                }
+                corpus_bytes = int(match[4]) * size_units[match[5]]
+                fuzzers[active].update(
+                    cov=int(match[1]),
+                    ft=int(match[2]),
+                    active_corpus_units=int(match[3]),
+                    active_corpus_bytes=corpus_bytes,
+                )
+                continue
+
+            for pattern, key in (
+                (EXECUTIONS, "executions"),
+                (EXEC_RATE, "average_exec_per_sec"),
+                (NEW_UNITS, "new_units_added"),
+            ):
+                match = pattern.search(line)
+                if match:
+                    fuzzers[active][key] = int(match[1])
+
+    return {
+        name: stats
+        for name, stats in fuzzers.items()
+        if "cov" in stats and "ft" in stats
+    }
+
+
+def file_fingerprint(directory):
+    digest = hashlib.sha256()
+    for path in sorted(p for p in directory.rglob("*") if p.is_file() and ".git" not in p.parts):
+        digest.update(path.relative_to(directory).as_posix().encode())
+        digest.update(b"\0")
+        try:
+            digest.update(str(path.stat().st_size).encode())
+            digest.update(b"\0")
+            with path.open("rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            print(f"WARN: cannot fingerprint {path}: {exc}", file=sys.stderr)
+    return digest.hexdigest()
+
+
+def corpus_snapshot(repo_sha):
+    root = CORPUS_ROOT / "corpus"
+    if not root.is_dir():
+        print(f"WARN: corpus directory not found: {root}", file=sys.stderr)
+        return
+    output = OUTPUT_DIR / "corpus_snapshots.csv"
+    existing = rows(output)
+    latest = {r["fuzzer"]: r for r in existing if r.get("fuzzing_repo_commit") == repo_sha}
+    for directory in sorted(p for p in root.iterdir() if p.is_dir()):
+        files = sorted(p for p in directory.rglob("*") if p.is_file() and ".git" not in p.parts)
+        size = 0
+        for p in files:
+            try:
+                size += p.stat().st_size
+            except OSError:
+                pass
+        fp = file_fingerprint(directory)
+        if latest.get(directory.name, {}).get("fingerprint") == fp:
+            continue
+        append_unique(
+            output,
+            CORPUS_FIELDS,
+            {
+                "observed_at": NOW,
+                "fuzzing_repo_commit": repo_sha,
+                "fuzzer": directory.name,
+                "persistent_corpus_files": len(files),
+                "persistent_corpus_bytes": size,
+                "fingerprint": fp,
+            },
+            ["fuzzing_repo_commit", "fuzzer", "fingerprint"],
+        )
+
+class TableParser(HTMLParser):
+    def __init__(self):
+        super().__init__(); self.rows = []; self.row = None; self.cell = None
+    def handle_starttag(self, tag, attrs):
+        if tag == "tr": self.row = []
+        elif tag in ("td", "th") and self.row is not None: self.cell = ""
+    def handle_data(self, data):
+        if self.cell is not None: self.cell += data
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self.cell is not None:
+            self.row.append(" ".join(self.cell.split())); self.cell = None
+        elif tag == "tr" and self.row is not None:
+            self.rows.append(self.row); self.row = None
+
+
+def pct(covered, total):
+    return round(100.0 * covered / total, 2) if total else ""
+
+
+def from_xml(path):
+    root = ET.parse(str(path)).getroot()
+    counters = {n.attrib.get("type"): n.attrib for n in root.findall("counter")}
+    line, branch = counters.get("LINE", {}), counters.get("BRANCH", {})
+    lm, lc = int(line.get("missed", 0)), int(line.get("covered", 0))
+    bm, bc = int(branch.get("missed", 0)), int(branch.get("covered", 0))
+    return {"line_missed": lm, "line_total": lm + lc, "line_coverage_percent": pct(lc, lm + lc), "branch_missed": bm, "branch_total": bm + bc, "branch_coverage_percent": pct(bc, bm + bc)}
+
+
+def from_html(path):
+    parser = TableParser(); parser.feed(path.read_text(encoding="utf-8", errors="replace"))
+    total_i = next((i for i, r in enumerate(parser.rows) if r and r[0].lower() == "total"), None)
+    if total_i is None: return None
+    header = next((r for r in reversed(parser.rows[:total_i]) if any("missed" in c.lower() and "lines" in c.lower() for c in r) or ("Missed" in r and "Lines" in r)), None)
+    if not header: return None
+    values = parser.rows[total_i]
+    def find(labels):
+        idx = next((i for i, h in enumerate(header) if h.strip() in labels), None)
+        return values[idx] if idx is not None and idx < len(values) else ""
+    try:
+        # JaCoCo variants either combine the label or split Missed / Lines into separate cells.
+        combined = next((i for i, h in enumerate(header) if "Missed Lines" == h.strip()), None)
+        if combined is not None:
+            lm = int(re.search(r"\d+", values[combined]).group())
+            line_cell = find({"Lines"})
+            lt = int(re.search(r"\d+", line_cell).group())
+        else:
+            li = header.index("Lines")
+            # In JaCoCo's standard table, the line-missed count is the
+            # "Missed" column immediately preceding the "Lines" column.
+            mi = li - 1
+            lm = int(re.search(r"\d+", values[mi]).group()); lt = int(re.search(r"\d+", values[li]).group())
+    except (ValueError, AttributeError, IndexError): return None
+    bm = bt = bp = ""
+    branch = find({"Missed Branches"})
+    m = re.search(r"(\d+)\s+of\s+(\d+)", branch)
+    if m: bm, bt = int(m[1]), int(m[2]); bp = pct(bt - bm, bt)
+    return {"line_missed": lm, "line_total": lt, "line_coverage_percent": pct(lt - lm, lt), "branch_missed": bm, "branch_total": bt, "branch_coverage_percent": bp}
+
+
+def coverage_snapshot(pages_sha):
+    candidates = [COVERAGE_ROOT / "coverage/latest/report/linux/jacoco.xml"]
+    candidates += sorted(COVERAGE_ROOT.rglob("jacoco.xml"))
+    candidates += [COVERAGE_ROOT / "coverage/latest/report/linux/index.html"]
+    candidates += sorted(COVERAGE_ROOT.rglob("index.html"))
+    seen = set()
+    for path in candidates:
+        if path in seen or not path.is_file(): continue
+        seen.add(path)
+        try:
+            summary = from_xml(path) if path.name == "jacoco.xml" else from_html(path)
+        except Exception as exc:
+            print(f"WARN: cannot parse coverage report {path}: {exc}", file=sys.stderr); continue
+        if not summary: continue
+        fp = file_fingerprint(path.parent)
+        append_unique(
+            OUTPUT_DIR / "coverage_snapshots.csv",
+            COVERAGE_FIELDS,
+            {
+                "observed_at": NOW,
+                "gh_pages_commit": pages_sha,
+                "report_path": str(path.relative_to(COVERAGE_ROOT)),
+                "report_fingerprint": fp,
+                **summary,
+            },
+            ["gh_pages_commit", "report_path", "report_fingerprint"],
+        )
+        print(f"Coverage snapshot inspected: {path.relative_to(COVERAGE_ROOT)}")
+        return
+    print("WARN: no readable JaCoCo XML or HTML report found", file=sys.stderr)
 
 
 def main():
-    data = {
-        "batch": read_csv("batch_fuzzers.csv"),
-        "corpus": read_csv("corpus_snapshots.csv"),
-        "coverage": read_csv("coverage_snapshots.csv"),
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
-    }
-    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
-
-    # A '<' can start an HTML closing-script tag even inside a JavaScript string.
-    # Encoding it as a JSON Unicode escape prevents the HTML parser from ending
-    # this script early; JSON parsing in the browser restores the original value.
-    payload = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
-
-    template = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>TFW fuzzing metrics</title>
-<style>
-:root{color-scheme:light dark;--bg:#f5f7fa;--card:#fff;--ink:#182230;--muted:#5e6b7b;--line:#dce3eb;--accent:#1769aa;--accent2:#e07a25}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
-header{background:#172b4d;color:white;padding:2rem max(1rem,calc((100% - 1120px)/2))}
-header h1{margin:0;font-size:clamp(1.7rem,4vw,2.5rem)}
-header p{margin:.4rem 0 0;color:#d8e4f4}
-.wrap{max-width:1120px;margin:auto;padding:1.25rem}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:1rem}
-.card,section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:1rem;box-shadow:0 2px 7px #172b4d0b}
-.kpi{font-size:1.8rem;font-weight:750;line-height:1.2}
-.muted,small{color:var(--muted)}
-section{margin-top:1rem}
-h2{font-size:1.25rem;margin:0 0 .65rem}
-label{display:block;font-weight:650;margin:.4rem 0}
-select{font:inherit;padding:.5rem;max-width:100%;border:1px solid var(--line);border-radius:7px;background:var(--card);color:var(--ink)}
-.chart{width:100%;height:auto;display:block;min-height:180px}
-.legend{display:flex;gap:1rem;flex-wrap:wrap;font-size:.9rem}
-.dot{display:inline-block;width:.7rem;height:.7rem;border-radius:50%;margin-right:.3rem}
-.note{font-size:.9rem;color:var(--muted)}
-.two{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1rem}
-table{border-collapse:collapse;width:100%;font-size:.9rem}
-th,td{text-align:left;padding:.5rem;border-bottom:1px solid var(--line)}
-th{color:var(--muted)}
-.tablewrap{overflow-x:auto}
-footer{padding:2rem 1rem;text-align:center;color:var(--muted)}
-a{color:var(--accent)}
-@media(prefers-color-scheme:dark){:root{--bg:#101722;--card:#182230;--ink:#e8edf4;--muted:#a5b2c2;--line:#344153;--accent:#79baff;--accent2:#ffb36e}}
-</style>
-</head>
-<body>
-<header>
-  <h1>TFW fuzzing metrics</h1>
-  <p>Historical ClusterFuzzLite performance, persistent corpus, and JaCoCo source coverage.</p>
-</header>
-<main class="wrap">
-  <div class="cards" id="kpis"></div>
-  <section>
-    <h2>Fuzzer history</h2>
-    <label for="fuzzer">Choose a fuzzer</label>
-    <select id="fuzzer"></select>
-    <p class="note">Each point is a successful batch run. <b>cov</b> and <b>ft</b> are libFuzzer counters, not source-coverage percentages.</p>
-    <div class="legend"><span><i class="dot" style="background:#1769aa"></i>cov</span><span><i class="dot" style="background:#e07a25"></i>ft</span></div>
-    <div id="fuzzer-chart"></div>
-    <h3>Execution throughput</h3>
-    <div id="throughput-chart"></div>
-  </section>
-  <div class="two">
-    <section>
-      <h2>JaCoCo source coverage</h2>
-      <div id="coverage-chart"></div>
-      <p class="note">Source-code line and branch coverage from the published JaCoCo report.</p>
-    </section>
-    <section>
-      <h2>Persistent corpus size</h2>
-      <label for="corpus-fuzzer">Choose a fuzzer</label>
-      <select id="corpus-fuzzer"></select>
-      <div id="corpus-chart"></div>
-      <p class="note">Corpus observations are collected independently of batch runs and are tied to a tfw-fuzzing commit.</p>
-    </section>
-  </div>
-  <section>
-    <h2>Latest fuzzer results</h2>
-    <div class="tablewrap" id="latest-table"></div>
-  </section>
-  <p class="note" id="updated"></p>
-</main>
-<footer>Generated from the <a href="https://github.com/tfw-org/tfw-metrics">TFW metrics repository</a>. Collection history is stored separately on the <code>metrics-data</code> branch.</footer>
-<script>
-const DATA=__DATA__;
-const $=id=>document.getElementById(id);
-
-// Empty or absent measurements are unavailable, not numeric zero.
-const num=v=>{
-  if(v==null || String(v).trim()==='') return null;
-  const n=Number(v);
-  return Number.isFinite(n)?n:null;
-};
-const fmt=n=>n==null?'—':new Intl.NumberFormat().format(n);
-const date=s=>s?new Date(s).toLocaleString():'';
-
-// Escape text inserted into HTML markup, such as a fuzzer name in a table.
-const esc=v=>String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;')
-  .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-
-function el(tag,attrs={},text=''){
-  const e=document.createElementNS('http://www.w3.org/2000/svg',tag);
-  for(const [k,v] of Object.entries(attrs)) e.setAttribute(k,v);
-  if(text!=='') e.textContent=text;
-  return e;
-}
-
-function svgChart(series,opts={}){
-  const w=900,h=280,L=58,R=20,T=18,B=42,iw=w-L-R,ih=h-T-B;
-  const points=series.flatMap(s=>s.values.map(p=>p.y).filter(v=>v!=null));
-  if(!points.length) return '<p class="muted">Not enough observations yet to draw a chart.</p>';
-
-  // Find bounds iteratively so large histories cannot exceed the argument limit.
-  // The default minimum includes zero, while the default maximum uses observed data.
-  let min=opts.min??0;
-  let max=opts.max??-Infinity;
-  for(const point of points){
-    if(opts.min==null) min=Math.min(min,point);
-    if(opts.max==null) max=Math.max(max,point);
-  }
-  if(max===min) max=min+1;
-
-  const valueCount=series[0].values.length;
-  const x=i=>L+(valueCount<2?iw/2:i*iw/(valueCount-1));
-  const y=v=>T+ih-(v-min)/(max-min)*ih;
-  const s=el('svg',{viewBox:`0 0 ${w} ${h}`,class:'chart',role:'img','aria-label':opts.label||'Historical metrics chart'});
-
-  for(let i=0;i<5;i++){
-    const val=min+(max-min)*i/4,yy=y(val);
-    s.append(el('line',{x1:L,y1:yy,x2:w-R,y2:yy,stroke:'var(--line)','stroke-width':1}));
-    s.append(el('text',{x:L-8,y:yy+4,'text-anchor':'end',fill:'var(--muted)','font-size':11},fmt(Math.round(val))));
-  }
-
-  series.forEach(ser=>{
-    let d='';
-
-    // A missing observation breaks the line. Do not connect measurements
-    // across a gap, since doing so would imply data exists between them.
-    const appendPath=path=>{
-      if(path) s.append(el('path',{d:path,fill:'none',stroke:ser.color,
-        'stroke-width':2.5,'stroke-linejoin':'round'}));
-    };
-
-    ser.values.forEach((p,i)=>{
-      if(p.y==null){
-        appendPath(d);
-        d='';
-        return;
-      }
-      d+=(d?' L':'M')+x(i)+' '+y(p.y);
-    });
-    appendPath(d);
-
-    // Keep the individual observation markers, including those adjacent to gaps.
-    ser.values.forEach((p,i)=>{
-      if(p.y!=null){
-        const c=el('circle',{cx:x(i),cy:y(p.y),r:3.5,fill:ser.color});
-        c.append(el('title',{},`${p.label}: ${fmt(p.y)}`));
-        s.append(c);
-      }
-    });
-  });
-
-  const vals=series[0].values;
-  [0,Math.floor((vals.length-1)/2),vals.length-1]
-    .filter((v,i,a)=>a.indexOf(v)===i&&v>=0)
-    .forEach(i=>{
-      if(vals[i]) s.append(el('text',{x:x(i),y:h-12,
-        'text-anchor':i===0?'start':i===vals.length-1?'end':'middle',
-        fill:'var(--muted)','font-size':11},vals[i].label));
-    });
-  return s.outerHTML;
-}
-
-function chartInto(id,series,opts){$(id).innerHTML=svgChart(series,opts);}
-
-const batch=DATA.batch.slice().sort((a,b)=>a.completed_at.localeCompare(b.completed_at));
-const corpus=DATA.corpus.slice().sort((a,b)=>a.observed_at.localeCompare(b.observed_at));
-const coverage=DATA.coverage.slice().sort((a,b)=>a.observed_at.localeCompare(b.observed_at));
-const latestByFuzzer=new Map();
-batch.forEach(r=>{
-  const prev=latestByFuzzer.get(r.fuzzer);
-  if(!prev||r.completed_at>prev.completed_at) latestByFuzzer.set(r.fuzzer,r);
-});
-const latestBatch=batch.length?batch.reduce((a,b)=>a.completed_at>b.completed_at?a:b):null;
-const latestCov=coverage[coverage.length-1];
-const lineCoverage=latestCov?num(latestCov.line_coverage_percent):null;
-
-$('kpis').innerHTML=[
-  ['Fuzzers tracked',new Set(batch.map(r=>r.fuzzer)).size],
-  ['Successful run/fuzzer samples',batch.length],
-  ['Latest batch run',latestBatch?date(latestBatch.completed_at):'No data'],
-  ['Line coverage',lineCoverage==null?'No data':`${lineCoverage}%`],
-  ['Corpus snapshots',corpus.length]
-].map(([label,value])=>`<div class="card"><div class="muted">${esc(label)}</div><div class="kpi">${esc(value)}</div></div>`).join('');
-
-const fuzzers=[...new Set(batch.map(r=>r.fuzzer))].sort();
-function fillSelect(id,values){
-  $(id).replaceChildren(...values.map(v=>{
-    const o=document.createElement('option');o.value=v;o.textContent=v;return o;
-  }));
-}
-fillSelect('fuzzer',fuzzers);
-const corpusFuzzers=[...new Set(corpus.map(r=>r.fuzzer))].sort();
-fillSelect('corpus-fuzzer',corpusFuzzers);
-
-function drawFuzzer(){
-  const name=$('fuzzer').value,rows=batch.filter(r=>r.fuzzer===name);
-  chartInto('fuzzer-chart',[
-    {name:'cov',color:'#1769aa',values:rows.map(r=>({label:date(r.completed_at),y:num(r.cov)}))},
-    {name:'ft',color:'#e07a25',values:rows.map(r=>({label:date(r.completed_at),y:num(r.ft)}))}
-  ],{label:`Historical libFuzzer counters for ${name}`});
-  chartInto('throughput-chart',[
-    {name:'exec/s',color:'#2c8c62',values:rows.map(r=>({label:date(r.completed_at),y:num(r.average_exec_per_sec)}))}
-  ],{label:`Execution throughput for ${name}`,min:0});
-  const r=latestByFuzzer.get(name);
-  $('latest-table').innerHTML=r
-    ? `<table><thead><tr><th>Fuzzer</th><th>Run date</th><th>cov</th><th>ft</th><th>Executions</th><th>Exec/sec</th><th>Active corpus units</th><th>Active corpus bytes</th><th>New units</th></tr></thead><tbody><tr>${
-      [r.fuzzer,date(r.completed_at),fmt(num(r.cov)),fmt(num(r.ft)),fmt(num(r.executions)),
-       fmt(num(r.average_exec_per_sec)),fmt(num(r.active_corpus_units)),
-       fmt(num(r.active_corpus_bytes)),fmt(num(r.new_units_added))]
-        .map(v=>`<td>${esc(v)}</td>`).join('')
-      }</tr></tbody></table>`
-    : '<p>No fuzzer data yet.</p>';
-}
-
-function drawCorpus(){
-  const name=$('corpus-fuzzer').value,rows=corpus.filter(r=>r.fuzzer===name);
-  chartInto('corpus-chart',[
-    {name:'Persistent corpus bytes',color:'#1769aa',
-     values:rows.map(r=>({label:date(r.observed_at),y:num(r.persistent_corpus_bytes)}))}
-  ],{label:`Persistent corpus size for ${name}`,min:0});
-}
-
-chartInto('coverage-chart',[
-  {name:'Line coverage %',color:'#1769aa',
-   values:coverage.map(r=>({label:date(r.observed_at),y:num(r.line_coverage_percent)}))},
-  {name:'Branch coverage %',color:'#e07a25',
-   values:coverage.map(r=>({label:date(r.observed_at),y:num(r.branch_coverage_percent)}))}
-],{label:'JaCoCo source coverage percentage',min:0,max:100});
-
-$('fuzzer').addEventListener('change',drawFuzzer);
-$('corpus-fuzzer').addEventListener('change',drawCorpus);
-
-// Always render the panels so empty datasets display their fallback messages.
-drawFuzzer();
-drawCorpus();
-
-$('updated').textContent=`Dashboard generated ${date(DATA.generatedAt)}. Coverage observations: ${coverage.length}; corpus observations: ${corpus.length}.`;
-</script>
-</body>
-</html>"""
-    OUTPUT.write_text(template.replace("__DATA__", payload), encoding="utf-8")
-    print(f"Wrote {OUTPUT} ({OUTPUT.stat().st_size} bytes)")
-
+    event = json.loads(EVENT_PATH.read_text(encoding="utf-8")) if EVENT_PATH.exists() else {}
+    run = event.get("workflow_run", event)
+    if run.get("name") != "ClusterFuzzLite batch fuzzing":
+        print(f"Ignoring workflow: {run.get('name', '(snapshot-only invocation)')}")
+        return 0
+    fuzzers = parse_batch_logs()
+    if not fuzzers:
+        print("ERROR: no final fuzzer summaries parsed; run remains retryable", file=sys.stderr)
+        return 1
+    for name, stats in sorted(fuzzers.items()):
+        append_unique(OUTPUT_DIR / "batch_fuzzers.csv", BATCH_FIELDS, {"run_id": run.get("id", ""), "run_attempt": run.get("run_attempt", ""), "completed_at": run.get("updated_at", NOW), "commit_sha": run.get("head_sha", ""), "fuzzer": name, **stats}, ["run_id", "run_attempt", "fuzzer"])
+    print(f"Recorded or confirmed metrics for {len(fuzzers)} dynamically discovered fuzzers")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
