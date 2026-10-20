@@ -65,16 +65,46 @@ jobs:
           mkdir -p "$LOGS_ROOT" "$OUTPUT_DIR"
           touch "$OUTPUT_DIR/processed-runs.txt"
 
-          # --paginate retrieves every page; --slurp lets jq combine the page responses.
-          gh api --paginate --slurp 'repos/tfw-org/tfw/actions/runs?status=completed&per_page=100' > "$RUNNER_TEMP/all-runs-pages.json"
+          # Retrieve every page and combine the page responses.
+          if ! gh api --paginate --slurp \
+            'repos/tfw-org/tfw/actions/runs?status=completed&per_page=100' \
+            > "$RUNNER_TEMP/all-runs-pages.json"; then
+            echo "ERROR: unable to discover completed workflow runs." >&2
+            exit 1
+          fi
 
-          jq -sr '[.[][] | .workflow_runs[]? | select(.conclusion == "success" and .name == "ClusterFuzzLite batch fuzzing")] | unique_by(.id, .run_attempt) | sort_by(.created_at)[] | @base64' "$RUNNER_TEMP/all-runs-pages.json" > "$RUNNER_TEMP/candidate-runs.txt"
+          if ! jq -sr \
+            '[.[][] | .workflow_runs[]? |
+              select(.conclusion == "success" and
+                     .name == "ClusterFuzzLite batch fuzzing")] |
+             unique_by(.id, .run_attempt) |
+             sort_by(.created_at)[] | @base64' \
+            "$RUNNER_TEMP/all-runs-pages.json" \
+            > "$RUNNER_TEMP/candidate-runs.txt"; then
+            echo "ERROR: unable to parse the completed workflow-run list." >&2
+            exit 1
+          fi
+
+          # Attempt every candidate, but do not commit partial collection.
+          # Failed runs remain unprocessed and will be retried next time.
+          collection_incomplete=0
 
           while IFS= read -r encoded; do
             [ -n "$encoded" ] || continue
-            run_json=$(printf '%s' "$encoded" | base64 --decode)
-            run_id=$(printf '%s' "$run_json" | jq -r '.id')
-            attempt=$(printf '%s' "$run_json" | jq -r '.run_attempt')
+
+            if ! run_json=$(printf '%s' "$encoded" | base64 --decode); then
+              echo "ERROR: unable to decode a candidate workflow run." >&2
+              collection_incomplete=1
+              continue
+            fi
+
+            if ! run_id=$(printf '%s' "$run_json" | jq -er '.id') ||
+               ! attempt=$(printf '%s' "$run_json" | jq -er '.run_attempt'); then
+              echo "ERROR: candidate workflow run has no valid ID or attempt." >&2
+              collection_incomplete=1
+              continue
+            fi
+
             key="$run_id:$attempt"
 
             grep -Fxq "$key" "$OUTPUT_DIR/processed-runs.txt" && continue
@@ -83,25 +113,40 @@ jobs:
             run_dir="$LOGS_ROOT/$key"
             mkdir -p "$run_dir"
 
-            if ! gh api "repos/tfw-org/tfw/actions/runs/$run_id/logs" > "$RUNNER_TEMP/run-logs.zip"; then
+            if ! gh api "repos/tfw-org/tfw/actions/runs/$run_id/logs" \
+              > "$RUNNER_TEMP/run-logs.zip"; then
               echo "WARN: unable to download logs for $key; will retry next run" >&2
+              collection_incomplete=1
               continue
             fi
 
             if ! unzip -q -o "$RUNNER_TEMP/run-logs.zip" -d "$run_dir"; then
               echo "WARN: invalid log archive for $key; will retry next run" >&2
               rm -rf "$run_dir"
+              collection_incomplete=1
               continue
             fi
 
             printf '%s\n' "$run_json" > "$RUNNER_TEMP/workflow-event.json"
 
-            if EVENT_PATH="$RUNNER_TEMP/workflow-event.json" LOGS_DIR="$run_dir" CORPUS_ROOT="$CORPUS_ROOT" COVERAGE_ROOT="$COVERAGE_ROOT" OUTPUT_DIR="$OUTPUT_DIR" python .github/scripts/collect_cflite_metrics.py; then
+            if EVENT_PATH="$RUNNER_TEMP/workflow-event.json" \
+               LOGS_DIR="$run_dir" \
+               CORPUS_ROOT="$CORPUS_ROOT" \
+               COVERAGE_ROOT="$COVERAGE_ROOT" \
+               OUTPUT_DIR="$OUTPUT_DIR" \
+               python .github/scripts/collect_cflite_metrics.py; then
               echo "$key" >> "$OUTPUT_DIR/processed-runs.txt"
             else
               echo "WARN: parsing failed for $key; will retry next run" >&2
+              collection_incomplete=1
             fi
           done < "$RUNNER_TEMP/candidate-runs.txt"
+
+          if [ "$collection_incomplete" -ne 0 ]; then
+            echo "ERROR: one or more runs could not be collected." >&2
+            echo "Refusing to commit partial metrics; failed runs will be retried." >&2
+            exit 1
+          fi
 
       - name: Record independent corpus and coverage snapshots
         env:
