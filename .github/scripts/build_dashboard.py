@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """Build a self-contained static dashboard from the metrics-data CSV files."""
 import csv
@@ -89,6 +90,10 @@ a{color:var(--accent)}
   <div class="two">
     <section>
       <h2>JaCoCo source coverage</h2>
+      <div class="legend" aria-label="Coverage chart legend">
+        <span><i class="dot" style="background:#1769aa"></i>Line coverage %</span>
+        <span><i class="dot" style="background:#e07a25"></i>Branch coverage %</span>
+      </div>
       <div id="coverage-chart"></div>
       <p class="note">Source-code line and branch coverage from the published JaCoCo report.</p>
     </section>
@@ -120,6 +125,12 @@ const num=v=>{
 const fmt=n=>n==null?'—':new Intl.NumberFormat().format(n);
 const date=s=>s?new Date(s).toLocaleString():'';
 
+const observation=(timestamp,y)=>({
+  x:Date.parse(timestamp),
+  label:date(timestamp),
+  y
+});
+
 // Escape text inserted into HTML markup, such as a fuzzer name in a table.
 const esc=v=>String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;')
   .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -146,8 +157,25 @@ function svgChart(series,opts={}){
   }
   if(max===min) max=min+1;
 
-  const valueCount=series[0].values.length;
-  const x=i=>L+(valueCount<2?iw/2:i*iw/(valueCount-1));
+  // Use elapsed time for the horizontal axis instead of evenly spaced array indices.
+  const times=series.flatMap(ser=>
+    ser.values.map(p=>p.x).filter(Number.isFinite)
+  );
+  if(!times.length) {
+    return '<p class="muted">Not enough observations yet to draw a chart.</p>';
+  }
+
+  let minX=Infinity;
+  let maxX=-Infinity;
+  for(const timestamp of times) {
+    minX=Math.min(minX,timestamp);
+    maxX=Math.max(maxX,timestamp);
+  }
+
+  const x=timestamp=>
+    L+(maxX===minX
+      ? iw/2
+      : (timestamp-minX)/(maxX-minX)*iw);
   const y=v=>T+ih-(v-min)/(max-min)*ih;
   const s=el('svg',{viewBox:`0 0 ${w} ${h}`,class:'chart',role:'img','aria-label':opts.label||'Historical metrics chart'});
 
@@ -167,33 +195,43 @@ function svgChart(series,opts={}){
         'stroke-width':2.5,'stroke-linejoin':'round'}));
     };
 
-    ser.values.forEach((p,i)=>{
-      if(p.y==null){
+    ser.values.forEach(p=>{
+      if(p.y==null || !Number.isFinite(p.x)) {
         appendPath(d);
         d='';
         return;
       }
-      d+=(d?' L':'M')+x(i)+' '+y(p.y);
+      d+=(d?' L':'M')+x(p.x)+' '+y(p.y);
     });
     appendPath(d);
 
     // Keep the individual observation markers, including those adjacent to gaps.
-    ser.values.forEach((p,i)=>{
-      if(p.y!=null){
-        const c=el('circle',{cx:x(i),cy:y(p.y),r:3.5,fill:ser.color});
+    ser.values.forEach(p=>{
+      if(p.y!=null && Number.isFinite(p.x)) {
+        const c=el('circle',{
+          cx:x(p.x),
+          cy:y(p.y),
+          r:3.5,
+          fill:ser.color
+        });
         c.append(el('title',{},`${p.label}: ${fmt(p.y)}`));
         s.append(c);
       }
     });
   });
 
+  // Show up to three date labels from the first series.
   const vals=series[0].values;
   [0,Math.floor((vals.length-1)/2),vals.length-1]
     .filter((v,i,a)=>a.indexOf(v)===i&&v>=0)
     .forEach(i=>{
-      if(vals[i]) s.append(el('text',{x:x(i),y:h-12,
-        'text-anchor':i===0?'start':i===vals.length-1?'end':'middle',
-        fill:'var(--muted)','font-size':11},vals[i].label));
+      const p=vals[i];
+      if(p && Number.isFinite(p.x)) {
+        s.append(el('text',{x:x(p.x),y:h-12,
+          'text-anchor':i===0?'start':
+            i===vals.length-1?'end':'middle',
+          fill:'var(--muted)','font-size':11},p.label));
+      }
     });
   return s.outerHTML;
 }
@@ -233,37 +271,62 @@ fillSelect('corpus-fuzzer',corpusFuzzers);
 function drawFuzzer(){
   const name=$('fuzzer').value,rows=batch.filter(r=>r.fuzzer===name);
   chartInto('fuzzer-chart',[
-    {name:'cov',color:'#1769aa',values:rows.map(r=>({label:date(r.completed_at),y:num(r.cov)}))},
-    {name:'ft',color:'#e07a25',values:rows.map(r=>({label:date(r.completed_at),y:num(r.ft)}))}
+    {name:'cov',color:'#1769aa',values:rows.map(r=>observation(r.completed_at,num(r.cov)))},
+    {name:'ft',color:'#e07a25',values:rows.map(r=>observation(r.completed_at,num(r.ft)))}
   ],{label:`Historical libFuzzer counters for ${name}`});
   chartInto('throughput-chart',[
-    {name:'exec/s',color:'#2c8c62',values:rows.map(r=>({label:date(r.completed_at),y:num(r.average_exec_per_sec)}))}
+    {name:'exec/s',color:'#2c8c62',values:rows.map(r=>observation(r.completed_at,num(r.average_exec_per_sec)))}
   ],{label:`Execution throughput for ${name}`,min:0});
-  const r=latestByFuzzer.get(name);
-  $('latest-table').innerHTML=r
-    ? `<table><thead><tr><th>Fuzzer</th><th>Run date</th><th>cov</th><th>ft</th><th>Executions</th><th>Exec/sec</th><th>Active corpus units</th><th>Active corpus bytes</th><th>New units</th></tr></thead><tbody><tr>${
-      [r.fuzzer,date(r.completed_at),fmt(num(r.cov)),fmt(num(r.ft)),fmt(num(r.executions)),
-       fmt(num(r.average_exec_per_sec)),fmt(num(r.active_corpus_units)),
-       fmt(num(r.active_corpus_bytes)),fmt(num(r.new_units_added))]
-        .map(v=>`<td>${esc(v)}</td>`).join('')
-      }</tr></tbody></table>`
-    : '<p>No fuzzer data yet.</p>';
+}
+
+function drawLatestTable(){
+  // This summary is independent of the selected history-chart fuzzer.
+  const rows=[...latestByFuzzer.values()]
+    .sort((a,b)=>a.fuzzer.localeCompare(b.fuzzer));
+
+  if(!rows.length){
+    $('latest-table').innerHTML='<p>No fuzzer data yet.</p>';
+    return;
+  }
+
+  const headers=[
+    'Fuzzer','Run date','cov','ft','Executions','Exec/sec',
+    'Active corpus units','Active corpus bytes','New units'
+  ];
+  const head='<thead><tr>'+
+    headers.map(h=>`<th>${esc(h)}</th>`).join('')+
+    '</tr></thead>';
+  const body='<tbody>'+rows.map(r=>'<tr>'+
+    [
+      r.fuzzer,
+      date(r.completed_at),
+      fmt(num(r.cov)),
+      fmt(num(r.ft)),
+      fmt(num(r.executions)),
+      fmt(num(r.average_exec_per_sec)),
+      fmt(num(r.active_corpus_units)),
+      fmt(num(r.active_corpus_bytes)),
+      fmt(num(r.new_units_added))
+    ].map(v=>`<td>${esc(v)}</td>`).join('')+
+    '</tr>').join('')+'</tbody>';
+
+  $('latest-table').innerHTML=`<table>${head}${body}</table>`;
 }
 
 function drawCorpus(){
   const name=$('corpus-fuzzer').value,rows=corpus.filter(r=>r.fuzzer===name);
   chartInto('corpus-chart',[
     {name:'Persistent corpus bytes',color:'#1769aa',
-     values:rows.map(r=>({label:date(r.observed_at),y:num(r.persistent_corpus_bytes)}))}
+     values:rows.map(r=>observation(r.observed_at,num(r.persistent_corpus_bytes)))}
   ],{label:`Persistent corpus size for ${name}`,min:0});
 }
 
 chartInto('coverage-chart',[
   {name:'Line coverage %',color:'#1769aa',
-   values:coverage.map(r=>({label:date(r.observed_at),y:num(r.line_coverage_percent)}))},
+   values:coverage.map(r=>observation(r.observed_at,num(r.line_coverage_percent)))},
   {name:'Branch coverage %',color:'#e07a25',
-   values:coverage.map(r=>({label:date(r.observed_at),y:num(r.branch_coverage_percent)}))}
-],{label:'JaCoCo source coverage percentage',min:0,max:100});
+   values:coverage.map(r=>observation(r.observed_at,num(r.branch_coverage_percent)))}
+],{label:'JaCoCo line and branch source coverage percentages over time',min:0,max:100});
 
 $('fuzzer').addEventListener('change',drawFuzzer);
 $('corpus-fuzzer').addEventListener('change',drawCorpus);
@@ -271,6 +334,7 @@ $('corpus-fuzzer').addEventListener('change',drawCorpus);
 // Always render the panels so empty datasets display their fallback messages.
 drawFuzzer();
 drawCorpus();
+drawLatestTable();
 
 $('updated').textContent=`Dashboard generated ${date(DATA.generatedAt)}. Coverage observations: ${coverage.length}; corpus observations: ${corpus.length}.`;
 </script>
