@@ -241,12 +241,32 @@ function chartInto(id,series,opts){$(id).innerHTML=svgChart(series,opts);}
 const batch=DATA.batch.slice().sort((a,b)=>a.completed_at.localeCompare(b.completed_at));
 const corpus=DATA.corpus.slice().sort((a,b)=>a.observed_at.localeCompare(b.observed_at));
 const coverage=DATA.coverage.slice().sort((a,b)=>a.observed_at.localeCompare(b.observed_at));
+
+// Use completion time first, then GitHub's monotonically increasing run ID
+// and attempt number to resolve equal completion timestamps deterministically.
+function isLaterRun(candidate,current){
+  if(candidate.completed_at!==current.completed_at){
+    return candidate.completed_at>current.completed_at;
+  }
+
+  const candidateId=num(candidate.run_id)??-1;
+  const currentId=num(current.run_id)??-1;
+  if(candidateId!==currentId){
+    return candidateId>currentId;
+  }
+
+  return (num(candidate.run_attempt)??-1)>
+    (num(current.run_attempt)??-1);
+}
+
 const latestByFuzzer=new Map();
 batch.forEach(r=>{
   const prev=latestByFuzzer.get(r.fuzzer);
-  if(!prev||r.completed_at>prev.completed_at) latestByFuzzer.set(r.fuzzer,r);
+  if(!prev||isLaterRun(r,prev)) latestByFuzzer.set(r.fuzzer,r);
 });
-const latestBatch=batch.length?batch.reduce((a,b)=>a.completed_at>b.completed_at?a:b):null;
+const latestBatch=batch.length
+  ?batch.reduce((a,b)=>isLaterRun(b,a)?b:a)
+  :null;
 const latestCov=coverage[coverage.length-1];
 const lineCoverage=latestCov?num(latestCov.line_coverage_percent):null;
 
