@@ -77,9 +77,9 @@ def parse_batch_logs():
     """
     fuzzers = {}
     read_errors = []
-    active = None
 
     for path in sorted(p for p in LOGS_DIR.rglob("*") if p.is_file()):
+        active = None
         try:
             lines = path.read_text(
                 encoding="utf-8", errors="replace"
