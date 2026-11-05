@@ -74,7 +74,7 @@ jobs:
           fi
 
           if ! jq -sr \
-            '[.[] | .workflow_runs[]? |
+            '[.[][] | .workflow_runs[]? |
               select(.conclusion == "success" and
                      .name == "ClusterFuzzLite batch fuzzing")] |
              unique_by(.id, .run_attempt) |
