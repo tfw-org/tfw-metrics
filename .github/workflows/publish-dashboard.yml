@@ -1,0 +1,72 @@
+name: Build and publish metrics dashboard
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/scripts/build_dashboard.py'
+      - '.github/workflows/publish-dashboard.yml'
+      - 'README.md'
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Collect ClusterFuzzLite metrics]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # Manual dispatches may publish only from main. Collection-triggered
+    # runs publish only after successful collection.
+    if: >-
+      (github.event_name != 'workflow_dispatch' ||
+       github.ref == 'refs/heads/main') &&
+      (github.event_name != 'workflow_run' ||
+       github.event.workflow_run.conclusion == 'success')
+
+    runs-on: ubuntu-latest
+
+    # Keep the lock for the complete build-and-deploy operation. This
+    # prevents concurrent runs from deploying snapshots out of order.
+    concurrency:
+      group: github-pages
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Check out trusted dashboard source
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check out metrics data
+        uses: actions/checkout@v4
+        with:
+          ref: metrics-data
+          path: metrics-data
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Build static dashboard
+        run: python .github/scripts/build_dashboard.py
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
