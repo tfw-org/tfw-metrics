@@ -62,6 +62,26 @@ jobs:
       - name: Build static dashboard
         run: python .github/scripts/build_dashboard.py
 
+      - name: Calculate GitHub Pages size
+        run: |
+          # Calculate the size of the files to be published.
+          total_bytes=$(find site -type f ! -name 'site-size.json' \
+            -printf '%s\n' | awk '{sum += $1} END {print sum}')
+          file_count=$(find site -type f ! -name 'site-size.json' | wc -l)
+          total_size=$(numfmt --to=iec --suffix=B "$total_bytes")
+
+          # Publish machine-readable site-size information.
+          cat > site/site-size.json <<EOF
+          {
+            "bytes": ${total_bytes},
+            "size": "${total_size}",
+            "files": ${file_count}
+          }
+          EOF
+
+          echo "GitHub Pages size: ${total_size} (${total_bytes} bytes)"
+          echo "Files published: ${file_count}"
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:

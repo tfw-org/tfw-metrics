@@ -1,6 +1,7 @@
 # TFW metrics
 
 [![Repository size](https://img.shields.io/github/repo-size/tfw-org/tfw-metrics?label=Repository%20size&color=blue)](https://github.com/tfw-org/tfw-metrics)
+[![GitHub Pages size](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Ftfw-org.github.io%2Ftfw-metrics%2Fsite-size.json&query=%24.size&label=GitHub%20Pages%20size&color=blue)](https://tfw-org.github.io/tfw-metrics/)
 
 This repository collects historical metrics from TFW's ClusterFuzzLite runs. It is separate from the `tfw` library and `tfw-fuzzing` corpus/report repository.
 
