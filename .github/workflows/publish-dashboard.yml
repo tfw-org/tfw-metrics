@@ -15,10 +15,10 @@ on:
 permissions:
   contents: read
 
-# Keep the complete build-and-deploy operation serialized. This prevents
-# concurrent runs from deploying snapshots out of order.
+# Keep eligible build-and-deploy operations serialized. Ineligible runs
+# get unique groups so they cannot replace pending dashboard publications.
 concurrency:
-  group: github-pages
+  group: ${{ (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main') && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && 'github-pages' || format('github-pages-ineligible-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
