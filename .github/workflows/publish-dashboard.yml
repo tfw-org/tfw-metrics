@@ -15,8 +15,14 @@ on:
 permissions:
   contents: read
 
+# Keep the complete build-and-deploy operation serialized. This prevents
+# concurrent runs from deploying snapshots out of order.
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
 jobs:
-  publish:
+  build:
     # Manual dispatches may publish only from main. Collection-triggered
     # runs publish only after successful collection.
     if: >-
@@ -27,20 +33,8 @@ jobs:
 
     runs-on: ubuntu-latest
 
-    # Keep the lock for the complete build-and-deploy operation. This
-    # prevents concurrent runs from deploying snapshots out of order.
-    concurrency:
-      group: github-pages
-      cancel-in-progress: false
-
     permissions:
       contents: read
-      pages: write
-      id-token: write
-
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
 
     steps:
       - name: Check out trusted dashboard source
@@ -87,8 +81,19 @@ jobs:
         with:
           path: site
 
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      pages: write
+      id-token: write
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-        with:
-          timeout: 1200000
